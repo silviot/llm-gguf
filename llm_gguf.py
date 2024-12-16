@@ -323,28 +323,63 @@ class GgufEmbeddingModel(llm.EmbeddingModel):
 
 
 def download_gguf_model(url, models_file_func, aliases):
-    """Download a GGUF model and register it in the specified models file"""
-    with httpx.stream("GET", url, follow_redirects=True) as response:
+    """Download a GGUF model and register it in the specified models file, with resume capability"""
+    filename = url.split("/")[-1]
+    download_path = _ensure_models_dir() / filename
+
+    # Initialize starting byte and mode
+    start_byte = 0
+    mode = "wb"
+
+    # Check for partial download
+    if download_path.exists():
+        start_byte = download_path.stat().st_size
+        mode = "ab"
+
+    headers = {}
+    if start_byte > 0:
+        headers["Range"] = f"bytes={start_byte}-"
+
+    with httpx.stream("GET", url, follow_redirects=True, headers=headers) as response:
+        # Check if server supports resume
+        if start_byte > 0 and response.status_code != 206:
+            # Server doesn't support resume or file is complete
+            if response.status_code == 200:
+                click.echo("Server doesn't support resume. Starting fresh download.", err=True)
+                start_byte = 0
+                mode = "wb"
+            else:
+                raise click.ClickException(f"Failed to resume download: HTTP {response.status_code}")
+
         total_size = response.headers.get("content-length")
+        if total_size is not None:
+            total_size = int(total_size)
+            if start_byte > 0:
+                # For resumed downloads, content-length is remaining bytes
+                total_size += start_byte
 
-        filename = url.split("/")[-1]
-        download_path = _ensure_models_dir() / filename
-        if download_path.exists():
-            raise click.ClickException(f"File already exists at {download_path}")
-
-        with open(download_path, "wb") as fp:
+        with open(download_path, mode) as fp:
             if total_size is not None:
-                total_size = int(total_size)
+                # Create progress bar for total size and manually update for initial progress
                 with click.progressbar(
                     length=total_size,
                     label="Downloading {}".format(human_size(total_size)),
                 ) as bar:
+                    # Update to starting position if resuming
+                    if start_byte > 0:
+                        bar.update(start_byte)
+                    # Continue with remaining download
                     for data in response.iter_bytes(1024):
                         fp.write(data)
                         bar.update(len(data))
             else:
+                # For servers that don't provide content length
+                downloaded = start_byte
                 for data in response.iter_bytes(1024):
                     fp.write(data)
+                    downloaded += len(data)
+                    click.echo(f"\rDownloaded: {human_size(downloaded)}", nl=False, err=True)
+                click.echo("", err=True)  # New line after progress
 
         click.echo(f"Downloaded model to {download_path}", err=True)
         models_file = models_file_func()

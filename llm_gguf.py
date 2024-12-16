@@ -328,35 +328,65 @@ def download_gguf_model(url, models_file_func, aliases):
     download_path = _ensure_models_dir() / filename
 
     # Initialize starting byte and mode
-    start_byte = 0
+    local_file_size = 0
     mode = "wb"
 
     # Check for partial download
     if download_path.exists():
-        start_byte = download_path.stat().st_size
+        local_file_size = download_path.stat().st_size
         mode = "ab"
 
     headers = {}
-    if start_byte > 0:
-        headers["Range"] = f"bytes={start_byte}-"
+    if local_file_size > 0:
+        headers["Range"] = f"bytes={local_file_size}-"
+
+    head_response = httpx.head(url, follow_redirects=True)
+    total_size = int(head_response.headers.get("content-length", 0))
 
     with httpx.stream("GET", url, follow_redirects=True, headers=headers) as response:
-        # Check if server supports resume
-        if start_byte > 0 and response.status_code != 206:
-            # Server doesn't support resume or file is complete
-            if response.status_code == 200:
-                click.echo("Server doesn't support resume. Starting fresh download.", err=True)
-                start_byte = 0
-                mode = "wb"
-            else:
-                raise click.ClickException(f"Failed to resume download: HTTP {response.status_code}")
+        # Handle various response status codes
+        if local_file_size > 0:
+            if response.status_code == 416:
+                # Range Not Satisfiable - file might be complete
+                # Verify file size matches expected size
+                if local_file_size == total_size:
+                    click.echo("File is already completely downloaded.", err=True)
+                    # Register the model and return
+                    models_file = models_file_func()
+                    models = json.loads(models_file.read_text())
+                    model_id = download_path.stem
+                    info = {
+                        "path": str(download_path.resolve()),
+                        "aliases": aliases,
+                    }
+                    models[model_id] = info
+                    models_file.write_text(json.dumps(models, indent=2))
+                    return
+                elif local_file_size > total_size:
+                    # File is corrupted or incomplete
+                    click.echo(
+                        f"File {download_path} appears corrupted. "
+                        f"File is {local_file_size} bytes but remote is smaller ({total_size} bytes). "
+                        "Remove and retry.",
+                        err=True,
+                    )
+                    raise click.Abort()
+            elif response.status_code != 206:
+                # Server doesn't support resume
+                if response.status_code == 200:
+                    click.echo(
+                        "Server doesn't support resume. Starting fresh download.",
+                        err=True,
+                    )
+                    local_file_size = 0
+                    mode = "wb"
+                else:
+                    raise click.ClickException(
+                        f"Failed to resume download: HTTP {response.status_code}"
+                    )
 
-        total_size = response.headers.get("content-length")
         if total_size is not None:
             total_size = int(total_size)
-            if start_byte > 0:
-                # For resumed downloads, content-length is remaining bytes
-                total_size += start_byte
 
         with open(download_path, mode) as fp:
             if total_size is not None:
@@ -366,19 +396,21 @@ def download_gguf_model(url, models_file_func, aliases):
                     label="Downloading {}".format(human_size(total_size)),
                 ) as bar:
                     # Update to starting position if resuming
-                    if start_byte > 0:
-                        bar.update(start_byte)
+                    if local_file_size > 0:
+                        bar.update(local_file_size)
                     # Continue with remaining download
                     for data in response.iter_bytes(1024):
                         fp.write(data)
                         bar.update(len(data))
             else:
                 # For servers that don't provide content length
-                downloaded = start_byte
+                downloaded = local_file_size
                 for data in response.iter_bytes(1024):
                     fp.write(data)
                     downloaded += len(data)
-                    click.echo(f"\rDownloaded: {human_size(downloaded)}", nl=False, err=True)
+                    click.echo(
+                        f"\rDownloaded: {human_size(downloaded)}", nl=False, err=True
+                    )
                 click.echo("", err=True)  # New line after progress
 
         click.echo(f"Downloaded model to {download_path}", err=True)
